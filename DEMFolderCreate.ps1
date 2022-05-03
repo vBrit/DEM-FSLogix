@@ -1,6 +1,7 @@
 ﻿<#
-This Script Creates a folder that will be used by FSLogix and applies the 
+This Script Creates a folder that will be used by Dynamic Environment Manager and applies the 
 Share and NTFS permissions base on Security Groups
+
 Karl Newick 
 www.vbrit.net
 #>
