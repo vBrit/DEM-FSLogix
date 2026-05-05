@@ -1,63 +1,63 @@
-﻿<#
+<#
 .SYNOPSIS
-Creates Omnissa Dynamic Environment Manager configuration and profile archive shares.
+Creates or configures Omnissa DEM Configuration and Profile Archive shares.
 
 .DESCRIPTION
-Creates:
-  - DEM Configuration share
-  - DEM Profile Archives share
+Supports:
+  - Windows File Server
+  - Nutanix Files SMB shares
 
-Aligned to Omnissa DEM Install and Configuration Guide v2603:
-  - Dynamic Environment Manager Configuration Share
-    https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/DynamicEnvironmentManagerConfigurationShare.html
+Omnissa references:
+  Dynamic Environment Manager Configuration Share:
+  https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/DynamicEnvironmentManagerConfigurationShare.html
 
-  - Profile Archives Share
-    https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/ProfileArchivesShare.html
+  Profile Archives Share:
+  https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/ProfileArchivesShare.html
 
-.NOTES
-Run from an elevated PowerShell session on the file server.
-
-Update the variables in the "CUSTOMISE THESE VALUES" section before running.
+Nutanix reference:
+  Nutanix Files Share and Export Permissions:
+  https://portal.nutanix.com/docs/Files-v5_1%3Afil-file-server-authorization-c.html
 #>
 
 #Requires -RunAsAdministrator
+
+$ErrorActionPreference = 'Stop'
 
 # -----------------------------
 # CUSTOMISE THESE VALUES
 # -----------------------------
 
-$DriveLetter        = 'C:'
-$RootFolder         = 'DEM'
+# Options:
+#   WindowsFileServer
+#   NutanixFiles
+$StoragePlatform = 'WindowsFileServer'
+
+# Windows File Server local paths
+$DriveLetter = 'C:'
+$RootFolder  = 'DEM'
 
 $FolderConfiguration = 'Configuration'
-$ConfigShareName     = 'DEM-Config'
+$FolderProfiles      = 'Profiles'
 
-$FolderProfiles    = 'Profiles'
-$ProfileShareName  = 'DEM-Profile'
+$ConfigShareName  = 'DEM-Config'
+$ProfileShareName = 'DEM-Profile'
 
-# Recommended: replace broad built-in/domain groups with dedicated AD security groups.
-$DEMAdmins    = 'DEM - Admins'
-$DEMUsers     = 'Domain Users'
-$DEMComputers = 'Domain Computers'
+# Nutanix Files UNC paths.
+# These shares must already exist on Nutanix Files.
+$NutanixConfigUNC   = '\\NUTANIX-FILES-FQDN\DEM-Config'
+$NutanixProfilesUNC = '\\NUTANIX-FILES-FQDN\DEM-Profile'
 
-# Set to $true only if you use DEM Computer Environment Settings.
+# Recommended: use dedicated AD security groups.
+$DEMAdmins    = 'DOMAIN\DEM-Admins'
+$DEMUsers     = 'DOMAIN\DEM-Users'
+$DEMComputers = 'DOMAIN\DEM-Computers'
+
+# Required if using DEM Computer Environment Settings / computer-based DEM settings.
 $EnableComputerEnvironmentSettingsSupport = $true
 
 # -----------------------------
-# DO NOT EDIT BELOW UNLESS NEEDED
+# FUNCTIONS
 # -----------------------------
-
-$ErrorActionPreference = 'Stop'
-
-$DEMRootDirectory          = Join-Path $DriveLetter $RootFolder
-$DEMConfigurationDirectory = Join-Path $DEMRootDirectory $FolderConfiguration
-$DEMProfilesDirectory      = Join-Path $DEMRootDirectory $FolderProfiles
-
-function Test-LocalAdmin {
-    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-    return $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
-}
 
 function Ensure-Directory {
     param(
@@ -72,19 +72,6 @@ function Ensure-Directory {
     else {
         Write-Host "Folder already exists: $Path"
     }
-}
-
-function Reset-NtfsInheritance {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Path
-    )
-
-    Write-Host "Resetting NTFS permissions on: $Path"
-    icacls $Path /reset | Out-Null
-
-    Write-Host "Removing inherited permissions on: $Path"
-    icacls $Path /inheritance:r | Out-Null
 }
 
 function Ensure-SmbShare {
@@ -124,85 +111,130 @@ function Ensure-SmbShare {
             FolderEnumerationMode = 'AccessBased'
         }
 
-        if ($FullAccess)  { $params.FullAccess  = $FullAccess }
-        if ($ChangeAccess){ $params.ChangeAccess = $ChangeAccess }
-        if ($ReadAccess)  { $params.ReadAccess  = $ReadAccess }
+        if ($FullAccess)   { $params.FullAccess   = $FullAccess }
+        if ($ChangeAccess) { $params.ChangeAccess = $ChangeAccess }
+        if ($ReadAccess)   { $params.ReadAccess   = $ReadAccess }
 
         New-SmbShare @params | Out-Null
         Write-Host "Created SMB share: $Name"
     }
 }
 
-if (-not (Test-LocalAdmin)) {
-    throw "This script must be run from an elevated PowerShell session."
+function Reset-NtfsInheritance {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
+
+    Write-Host "Resetting NTFS permissions on: $Path"
+    icacls $Path /reset | Out-Null
+
+    Write-Host "Disabling inheritance on: $Path"
+    icacls $Path /inheritance:r | Out-Null
 }
 
-Write-Host "Creating DEM folder structure..."
+function Set-DemConfigShareAcl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
 
-Ensure-Directory -Path $DEMRootDirectory
-Ensure-Directory -Path $DEMConfigurationDirectory
-Ensure-Directory -Path $DEMProfilesDirectory
+    Reset-NtfsInheritance -Path $Path
 
-# ----------------------------------------------------
-# DEM Configuration Share
-# Omnissa requirement:
-#   - DEM administrators: Full Control
-#   - DEM users: Read access
-#   - DEM computers: Read access when computer settings are used
-#   - Offline caching disabled
-# ----------------------------------------------------
+    icacls $Path /grant "SYSTEM:(OI)(CI)F" | Out-Null
+    icacls $Path /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
+    icacls $Path /grant "$DEMUsers:(OI)(CI)RX" | Out-Null
 
-Write-Host "`nConfiguring DEM Configuration share..."
+    if ($EnableComputerEnvironmentSettingsSupport) {
+        icacls $Path /grant "$DEMComputers:(OI)(CI)RX" | Out-Null
+    }
 
-Ensure-SmbShare `
-    -Name $ConfigShareName `
-    -Path $DEMConfigurationDirectory `
-    -FullAccess @($DEMAdmins) `
-    -ReadAccess @($DEMUsers, $DEMComputers)
-
-Reset-NtfsInheritance -Path $DEMConfigurationDirectory
-
-icacls $DEMConfigurationDirectory /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
-icacls $DEMConfigurationDirectory /grant "$DEMUsers:(OI)(CI)RX" | Out-Null
-icacls $DEMConfigurationDirectory /grant "$DEMComputers:(OI)(CI)RX" | Out-Null
-
-Write-Host "DEM Configuration share configured successfully."
-
-# ----------------------------------------------------
-# DEM Profile Archives Share
-# Omnissa requirement:
-#   - Users need to create their own profile archive folder
-#   - CREATOR OWNER owns/manages created folders
-#   - Administrators have Full Control
-#   - Offline caching disabled
-# ----------------------------------------------------
-
-Write-Host "`nConfiguring DEM Profile Archives share..."
-
-Ensure-SmbShare `
-    -Name $ProfileShareName `
-    -Path $DEMProfilesDirectory `
-    -FullAccess @($DEMAdmins) `
-    -ChangeAccess @('Everyone')
-
-Reset-NtfsInheritance -Path $DEMProfilesDirectory
-
-icacls $DEMProfilesDirectory /grant "SYSTEM:(OI)(CI)F" | Out-Null
-icacls $DEMProfilesDirectory /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
-icacls $DEMProfilesDirectory /grant "CREATOR OWNER:(OI)(CI)(IO)F" | Out-Null
-
-# This folder only:
-# Users can create their own profile archive folder, list the root, read attributes, traverse, and synchronize.
-icacls $DEMProfilesDirectory /grant "$DEMUsers:(AD,R,S)" | Out-Null
-
-if ($EnableComputerEnvironmentSettingsSupport) {
-    # Required when DEM Computer Environment Settings are used.
-    icacls $DEMProfilesDirectory /grant "$DEMComputers:(AD,R,S)" | Out-Null
-    Write-Host "Computer Environment Settings support enabled for profile archive root."
+    Write-Host "DEM Configuration NTFS ACLs applied to: $Path"
 }
 
-Write-Host "DEM Profile Archives share configured successfully."
+function Set-DemProfileArchiveAcl {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
 
-Write-Host "`nCompleted successfully."
-Write-Host "Configuration share path: \\$env:COMPUTERNAME\$ConfigShareName"
-Write-Host "Profile archive share path: \\$env:COMPUTERNAME\$ProfileShareName"
+    Reset-NtfsInheritance -Path $Path
+
+    icacls $Path /grant "SYSTEM:(OI)(CI)F" | Out-Null
+    icacls $Path /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
+    icacls $Path /grant "CREATOR OWNER:(OI)(CI)(IO)F" | Out-Null
+
+    # This folder only:
+    # Allows users to create their own profile archive folder.
+    icacls $Path /grant "$DEMUsers:(AD,R,S)" | Out-Null
+
+    if ($EnableComputerEnvironmentSettingsSupport) {
+        icacls $Path /grant "$DEMComputers:(AD,R,S)" | Out-Null
+    }
+
+    Write-Host "DEM Profile Archive NTFS ACLs applied to: $Path"
+}
+
+# -----------------------------
+# MAIN
+# -----------------------------
+
+switch ($StoragePlatform) {
+
+    'WindowsFileServer' {
+
+        $DEMRootDirectory          = Join-Path $DriveLetter $RootFolder
+        $DEMConfigurationDirectory = Join-Path $DEMRootDirectory $FolderConfiguration
+        $DEMProfilesDirectory      = Join-Path $DEMRootDirectory $FolderProfiles
+
+        Ensure-Directory -Path $DEMRootDirectory
+        Ensure-Directory -Path $DEMConfigurationDirectory
+        Ensure-Directory -Path $DEMProfilesDirectory
+
+        Ensure-SmbShare `
+            -Name $ConfigShareName `
+            -Path $DEMConfigurationDirectory `
+            -FullAccess @($DEMAdmins) `
+            -ReadAccess @($DEMUsers, $DEMComputers)
+
+        Set-DemConfigShareAcl -Path $DEMConfigurationDirectory
+
+        Ensure-SmbShare `
+            -Name $ProfileShareName `
+            -Path $DEMProfilesDirectory `
+            -FullAccess @($DEMAdmins) `
+            -ChangeAccess @('Everyone')
+
+        Set-DemProfileArchiveAcl -Path $DEMProfilesDirectory
+
+        Write-Host "`nCompleted Windows File Server DEM share configuration."
+        Write-Host "Configuration share: \\$env:COMPUTERNAME\$ConfigShareName"
+        Write-Host "Profile archive share: \\$env:COMPUTERNAME\$ProfileShareName"
+    }
+
+    'NutanixFiles' {
+
+        Write-Host "Nutanix Files mode selected."
+        Write-Host "Skipping New-SmbShare / Set-SmbShare because shares must be created in Nutanix Files."
+
+        if (-not (Test-Path $NutanixConfigUNC)) {
+            throw "Cannot access Nutanix DEM Configuration UNC path: $NutanixConfigUNC"
+        }
+
+        if (-not (Test-Path $NutanixProfilesUNC)) {
+            throw "Cannot access Nutanix DEM Profile Archive UNC path: $NutanixProfilesUNC"
+        }
+
+        Set-DemConfigShareAcl -Path $NutanixConfigUNC
+        Set-DemProfileArchiveAcl -Path $NutanixProfilesUNC
+
+        Write-Host "`nCompleted Nutanix Files DEM NTFS ACL configuration."
+        Write-Host "Configuration share: $NutanixConfigUNC"
+        Write-Host "Profile archive share: $NutanixProfilesUNC"
+        Write-Host "Reminder: configure SMB share-level permissions in Nutanix Files / Prism."
+    }
+
+    default {
+        throw "Invalid StoragePlatform value. Use 'WindowsFileServer' or 'NutanixFiles'."
+    }
+}
