@@ -1,74 +1,208 @@
 ﻿<#
-This Script Creates a folder that will be used by Dynamic Environment Manager and applies the 
-Share and NTFS permissions base on Security Groups
+.SYNOPSIS
+Creates Omnissa Dynamic Environment Manager configuration and profile archive shares.
 
-Karl Newick 
-www.vbrit.net
+.DESCRIPTION
+Creates:
+  - DEM Configuration share
+  - DEM Profile Archives share
+
+Aligned to Omnissa DEM Install and Configuration Guide v2603:
+  - Dynamic Environment Manager Configuration Share
+    https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/DynamicEnvironmentManagerConfigurationShare.html
+
+  - Profile Archives Share
+    https://docs.omnissa.com/bundle/DEMInstallConfigGuideV2603/page/ProfileArchivesShare.html
+
+.NOTES
+Run from an elevated PowerShell session on the file server.
+
+Update the variables in the "CUSTOMISE THESE VALUES" section before running.
 #>
-$DriveLetter = 'C:'
+
+#Requires -RunAsAdministrator
+
+# -----------------------------
+# CUSTOMISE THESE VALUES
+# -----------------------------
+
+$DriveLetter        = 'C:'
+$RootFolder         = 'DEM'
+
 $FolderConfiguration = 'Configuration'
-$ConfigShareName = 'DEM-Config'
-$FolderProfiles = 'Profiles'
-$ProfileShareName = 'DEM-Profile'
-$DEMAdmins = 'DEM - Admins'
-$DEMUsers = 'Domain Users'
+$ConfigShareName     = 'DEM-Config'
+
+$FolderProfiles    = 'Profiles'
+$ProfileShareName  = 'DEM-Profile'
+
+# Recommended: replace broad built-in/domain groups with dedicated AD security groups.
+$DEMAdmins    = 'DEM - Admins'
+$DEMUsers     = 'Domain Users'
 $DEMComputers = 'Domain Computers'
 
-<#
-Do not Edit below
-#>
+# Set to $true only if you use DEM Computer Environment Settings.
+$EnableComputerEnvironmentSettingsSupport = $true
 
-mkdir "$DriveLetter\DEM\$FolderConfiguration"
+# -----------------------------
+# DO NOT EDIT BELOW UNLESS NEEDED
+# -----------------------------
 
-$DEMConfigurationDirectory = "$DriveLetter\DEM\$FolderConfiguration"
+$ErrorActionPreference = 'Stop'
 
-# Create Share and Apply Permissions
+$DEMRootDirectory          = Join-Path $DriveLetter $RootFolder
+$DEMConfigurationDirectory = Join-Path $DEMRootDirectory $FolderConfiguration
+$DEMProfilesDirectory      = Join-Path $DEMRootDirectory $FolderProfiles
 
-New-SMBShare -Name "$ConfigShareName" `
-    -Path "$DEMConfigurationDirectory" `
-    -FullAccess "$DEMAdmins" `
-    -ReadAccess "$DEMUsers", "$DEMComputers" `
-    -CachingMode None
+function Test-LocalAdmin {
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)
+}
 
-#Clear all Explicit Permissions on the folder
-ICACLS ("$DEMConfigurationDirectory") /reset
+function Ensure-Directory {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
 
-#Give Domain Admins Full Control
-ICACLS ("$DEMConfigurationDirectory") /grant ("$DEMAdmins" + ':(OI)(CI)F')
+    if (-not (Test-Path -Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+        Write-Host "Created folder: $Path"
+    }
+    else {
+        Write-Host "Folder already exists: $Path"
+    }
+}
 
-#Give Domain Users and Domain Computers Read Access
-ICACLS ("$DEMConfigurationDirectory") /grant ("$DEMComputers" + ':(OI)(CI)(RX,RA,RC,RD,S)')
-ICACLS ("$DEMConfigurationDirectory") /grant ("$DEMUsers" + ':(OI)(CI)(RX,RA,RC,RD,S)')
+function Reset-NtfsInheritance {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path
+    )
 
-#Disable Inheritance on the Folder. This is done last to avoid permission errors.
-ICACLS ("$DEMConfigurationDirectory") /inheritance:r
+    Write-Host "Resetting NTFS permissions on: $Path"
+    icacls $Path /reset | Out-Null
 
-# Create Profiles Share and Apply Permissions
+    Write-Host "Removing inherited permissions on: $Path"
+    icacls $Path /inheritance:r | Out-Null
+}
 
-mkdir "$DriveLetter\DEM\$FolderProfiles"
+function Ensure-SmbShare {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Name,
 
-$DEMProfilesDirectory = "$DriveLetter\DEM\$FolderProfiles"
+        [Parameter(Mandatory)]
+        [string]$Path,
 
-New-SMBShare -Name "$ProfileShareName" `
-    -Path "$DEMProfilesDirectory" `
-    -FullAccess "$DEMAdmins", "$DEMUsers" `
-    -CachingMode None `
-    -FolderEnumerationMode AccessBased
+        [string[]]$FullAccess,
 
-#Clear all Explicit Permissions on the folder
-ICACLS ("$DEMProfilesDirectory") /reset
+        [string[]]$ChangeAccess,
 
-#Add CREATOR OWNER permission
-ICACLS ("$DEMProfilesDirectory") /grant ("CREATOR OWNER" + ':(OI)(CI)(IO)F')
+        [string[]]$ReadAccess
+    )
 
-#Add SYSTEM permission
-ICACLS ("$DEMProfilesDirectory") /grant ("SYSTEM" + ':(OI)(CI)F')
+    $existingShare = Get-SmbShare -Name $Name -ErrorAction SilentlyContinue
 
-#Give Domain Admins Full Control
-ICACLS ("$DEMProfilesDirectory") /grant ("$DEMAdmins" + ':(OI)(CI)F')
+    if ($existingShare) {
+        Write-Host "SMB share already exists: $Name"
 
-#Apply Create Folder/Append Data, List Folder/Read Data, Read Attributes, Traverse Folder/Execute File, Read permissions to this folder only. Synchronize is required in order for the permissions to work
-ICACLS ("$DEMProfilesDirectory") /grant ("$DEMUsers" + ':(AD,R,S)')
+        if ($existingShare.Path -ne $Path) {
+            throw "Share '$Name' already exists but points to '$($existingShare.Path)' instead of '$Path'."
+        }
 
-#Disable Inheritance on the Folder. This is done last to avoid permission errors.
-ICACLS ("$DEMProfilesDirectory") /inheritance:r
+        Set-SmbShare -Name $Name `
+            -CachingMode None `
+            -FolderEnumerationMode AccessBased `
+            -Force | Out-Null
+    }
+    else {
+        $params = @{
+            Name                  = $Name
+            Path                  = $Path
+            CachingMode           = 'None'
+            FolderEnumerationMode = 'AccessBased'
+        }
+
+        if ($FullAccess)  { $params.FullAccess  = $FullAccess }
+        if ($ChangeAccess){ $params.ChangeAccess = $ChangeAccess }
+        if ($ReadAccess)  { $params.ReadAccess  = $ReadAccess }
+
+        New-SmbShare @params | Out-Null
+        Write-Host "Created SMB share: $Name"
+    }
+}
+
+if (-not (Test-LocalAdmin)) {
+    throw "This script must be run from an elevated PowerShell session."
+}
+
+Write-Host "Creating DEM folder structure..."
+
+Ensure-Directory -Path $DEMRootDirectory
+Ensure-Directory -Path $DEMConfigurationDirectory
+Ensure-Directory -Path $DEMProfilesDirectory
+
+# ----------------------------------------------------
+# DEM Configuration Share
+# Omnissa requirement:
+#   - DEM administrators: Full Control
+#   - DEM users: Read access
+#   - DEM computers: Read access when computer settings are used
+#   - Offline caching disabled
+# ----------------------------------------------------
+
+Write-Host "`nConfiguring DEM Configuration share..."
+
+Ensure-SmbShare `
+    -Name $ConfigShareName `
+    -Path $DEMConfigurationDirectory `
+    -FullAccess @($DEMAdmins) `
+    -ReadAccess @($DEMUsers, $DEMComputers)
+
+Reset-NtfsInheritance -Path $DEMConfigurationDirectory
+
+icacls $DEMConfigurationDirectory /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
+icacls $DEMConfigurationDirectory /grant "$DEMUsers:(OI)(CI)RX" | Out-Null
+icacls $DEMConfigurationDirectory /grant "$DEMComputers:(OI)(CI)RX" | Out-Null
+
+Write-Host "DEM Configuration share configured successfully."
+
+# ----------------------------------------------------
+# DEM Profile Archives Share
+# Omnissa requirement:
+#   - Users need to create their own profile archive folder
+#   - CREATOR OWNER owns/manages created folders
+#   - Administrators have Full Control
+#   - Offline caching disabled
+# ----------------------------------------------------
+
+Write-Host "`nConfiguring DEM Profile Archives share..."
+
+Ensure-SmbShare `
+    -Name $ProfileShareName `
+    -Path $DEMProfilesDirectory `
+    -FullAccess @($DEMAdmins) `
+    -ChangeAccess @('Everyone')
+
+Reset-NtfsInheritance -Path $DEMProfilesDirectory
+
+icacls $DEMProfilesDirectory /grant "SYSTEM:(OI)(CI)F" | Out-Null
+icacls $DEMProfilesDirectory /grant "$DEMAdmins:(OI)(CI)F" | Out-Null
+icacls $DEMProfilesDirectory /grant "CREATOR OWNER:(OI)(CI)(IO)F" | Out-Null
+
+# This folder only:
+# Users can create their own profile archive folder, list the root, read attributes, traverse, and synchronize.
+icacls $DEMProfilesDirectory /grant "$DEMUsers:(AD,R,S)" | Out-Null
+
+if ($EnableComputerEnvironmentSettingsSupport) {
+    # Required when DEM Computer Environment Settings are used.
+    icacls $DEMProfilesDirectory /grant "$DEMComputers:(AD,R,S)" | Out-Null
+    Write-Host "Computer Environment Settings support enabled for profile archive root."
+}
+
+Write-Host "DEM Profile Archives share configured successfully."
+
+Write-Host "`nCompleted successfully."
+Write-Host "Configuration share path: \\$env:COMPUTERNAME\$ConfigShareName"
+Write-Host "Profile archive share path: \\$env:COMPUTERNAME\$ProfileShareName"
